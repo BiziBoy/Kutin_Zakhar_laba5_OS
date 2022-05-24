@@ -3,113 +3,144 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Text;
-using System.Threading.Channels;
 using System.Threading.Tasks;
 
 namespace Kutin_Zakhar_laba5_OS
 {
-    public class MyThreadPool
+    public class MyThreadPool: IDisposable
     {
-        private readonly ThreadPriority _Priority;
-        private readonly Task[] _Threads;
-        private readonly string? _Name;
-        private readonly TaskStatus _Status;       
-        
-        ////очередь кортежей первый параметр - действие, которое надо выполнить, второй - параметр действия
-        //private readonly Queue<(Action<object?> Work, object? Parameter)> _Works = new();
+        private readonly ThreadPriority _Prioroty;
+        private readonly string _Name;
+        private readonly Thread[] _Threads;
+        private readonly Queue<(Action<object?> Work, object? Parameter)> _Works = new();
+        private volatile bool _CanWork = true;
 
-        //private readonly AutoResetEvent _WorkingEvent = new(false);
-        //private readonly AutoResetEvent _ExecuteEvent = new(true);
+        private readonly AutoResetEvent _WorkingEvent = new(false);
+        private readonly AutoResetEvent _ExecuteEvent = new(true);
 
-        public MyThreadPool(int? MaxThreadsCount, ThreadPriority Priority = ThreadPriority.Normal, string? Name = null)
+        public string Name => _Name;
+
+        public MyThreadPool(int MaxThreadsCount, ThreadPriority Prioroty = ThreadPriority.Normal, string? Name = null)
         {
             if (MaxThreadsCount <= 0)
-            {
-                throw new ArgumentOutOfRangeException(nameof(MaxThreadsCount), MaxThreadsCount, "Число потоков в пуле должны быть больше 0");
-            }
-            _Priority = Priority;
-            _Name = Name;
+                throw new ArgumentOutOfRangeException(nameof(MaxThreadsCount), MaxThreadsCount, "Число потоков в пуле должно быть больше, либо равно 1");
+
+            _Prioroty = Prioroty;
+            _Threads = new Thread[MaxThreadsCount];
+            // ReSharper disable once VirtualMemberCallInConstructor
+            _Name = Name ?? GetHashCode().ToString("x");
             Initialize();
         }
 
         private void Initialize()
         {
-            //создаю общий канал данных
-            Channel<string> channel0 = Channel.CreateBounded<string>(3);
-            Channel<string> channel1 = Channel.CreateBounded<string>(3);
-            Channel<string> channel2 = Channel.CreateBounded<string>(3);
-            //создал токен отмены
-            var cts0 = new CancellationTokenSource();
-            var cts1 = new CancellationTokenSource();
-            var cts2 = new CancellationTokenSource();
-            //создаются потоки
-            _Threads[0] = Task.Run(() => { new TaskHash(0, channel0.Writer, channel0.Reader, "1115dd800feaacefdf481f1f9070374a2a81e27880f187396db67958b207cbad".ToUpper(), cts0.Token); }, cts0.Token);
-            _Threads[1] = Task.Run(() => { new TaskHash(1, channel1.Writer, channel1.Reader, "3a7bd3e2360a3d29eea436fcfb7e44c735d117c42d1c1835420b6b9942dd4f1b".ToUpper(), cts1.Token); }, cts1.Token);
-            _Threads[2] = Task.Run(() => { new TaskHash(2, channel2.Writer, channel2.Reader, "74e1bb62f8dabb8125a58852b63bdf6eaef667cb56ac7f7cdba6d7305c50a22f".ToUpper(), cts2.Token); }, cts2.Token);
-            
-            Task.WaitAll(_Threads);
-        }
-
-        private void ChangePriority(char modification)
-        {
-
-        }
-
-        private void BlockAThread()
-        {
-            new Thread(() =>
+            var thread_pool_name = Name;
+            for (var i = 0; i < _Threads.Length; i++)
             {
-                if ()
+                var name = $"{nameof(MyThreadPool)}[{thread_pool_name}]-Thread[{i}]";
+                var thread = new Thread(WorkingThread)
                 {
+                    Name = name,
+                    IsBackground = true,
+                    Priority = _Prioroty
+                };
+                _Threads[i] = thread;
+                thread.Start();
+            }
+        }
 
-                }
-                while (true)
+        public void Execute(Action Work) => Execute(null, _ => Work());
+
+        public void Execute(object? Parameter, Action<object?> Work)
+        {
+            if (!_CanWork) throw new InvalidOperationException("Попытка передать задание уничтоженному пулу потоков");
+
+            _ExecuteEvent.WaitOne(); // запрашиваем доступ к очереди
+            if (!_CanWork) throw new InvalidOperationException("Попытка передать задание уничтоженному пулу потоков");
+
+            _Works.Enqueue((Work, Parameter));
+            _ExecuteEvent.Set();    // разрешаем доступ к очереди
+
+            _WorkingEvent.Set();
+        }
+
+        private void WorkingThread()
+        {
+            var thread_name = Thread.CurrentThread.Name;
+            Trace.TraceInformation("Поток {0} запущен с id:{1}", thread_name, Environment.CurrentManagedThreadId);
+
+            try
+            {
+                while (_CanWork)
                 {
-                    if (Console.ReadKey(true).Key == ConsoleKey.Q)
+                    _WorkingEvent.WaitOne();
+                    if (!_CanWork) break;
+
+                    _ExecuteEvent.WaitOne(); // запрашиваем доступ к очередя
+
+                    while (_Works.Count == 0) // если (до тех пор пока) в очереди нет заданий
                     {
-                        cts0.Cancel();
-                        break;
+                        _ExecuteEvent.Set(); // освобождаем очередь
+                        _WorkingEvent.WaitOne(); // дожидаемся разрешения на выполнение
+                        if (!_CanWork) break;
+
+                        _ExecuteEvent.WaitOne(); // запрашиваем доступ к очереди вновь
+                    }
+
+                    var (work, parameter) = _Works.Dequeue();
+                    if (_Works.Count > 0) // если после изъятия из очереди задания там осталось ещё что-то
+                        _WorkingEvent.Set(); //  то запускаем ещё один поток на выполнение
+
+                    _ExecuteEvent.Set(); // разрешаем доступ к очереди
+
+                    Trace.TraceInformation("Поток {0}[id:{1}] выполняет задание", thread_name, Environment.CurrentManagedThreadId);
+                    try
+                    {
+                        var timer = Stopwatch.StartNew();
+                        work(parameter);
+                        timer.Stop();
+
+                        Trace.TraceInformation(
+                            "Поток {0}[id:{1}] выполнил задание за {2}мс",
+                            thread_name, Environment.CurrentManagedThreadId, timer.ElapsedMilliseconds);
+                    }
+                    catch (ThreadInterruptedException)
+                    {
+                        throw;
+                    }
+                    catch (Exception e)
+                    {
+                        Trace.TraceError("Ошибка выполнения задания в потоке {0}:{1}", thread_name, e);
                     }
                 }
-
-            }).Start();
+            }
+            catch (ThreadInterruptedException)
+            {
+                Trace.TraceWarning(
+                    "Поток {0} был принудительно прерван при завершении работы пула {1}",
+                    thread_name, Name);
+            }
+            finally
+            {
+                Trace.TraceInformation("Поток {0} завершил свою работу", thread_name);
+                if (!_WorkingEvent.SafeWaitHandle.IsClosed)
+                    _WorkingEvent.Set();
+            }
         }
 
-        private void ToPlanThreads()
+        private const int _DisposeThreadJoinTimeout = 100;
+        public void Dispose()
         {
+            _CanWork = false;
 
+            _WorkingEvent.Set();
+            foreach (var thread in _Threads)
+                if (!thread.Join(_DisposeThreadJoinTimeout))
+                    thread.Interrupt();
+
+            _ExecuteEvent.Dispose();
+            _WorkingEvent.Dispose();
+            Trace.TraceInformation("Пул потоков {0} уничтожен", Name);
         }
-
-        //public void Execute(Action Work) => Execute(null, _ => Work());
-
-        //public void Execute(object? Parameter, Action<Object> Work)
-        //{
-        //    _ExecuteEvent.WaitOne(); // запрашиваем доступ к очереди
-        //    _Works.Enqueue((Work, Parameter));
-        //    _ExecuteEvent.Set(); // разрешили доступ к очереди
-
-        //    _WorkingEvent.Set(); // разрешили работу потоку
-        //}
-
-        //private void WorkingThread()
-        //{
-        //    while (true)
-        //    {
-        //        _WorkingEvent.WaitOne();
-        //        _ExecuteEvent.WaitOne(); // запрашиваем доступ к очереди
-        //        var (work, parametr) = _Works.Dequeue();
-        //        _ExecuteEvent.Set(); // разрешили доступ к очереди
-        //        try
-        //        {
-        //            work(parametr);
-        //        }
-        //        catch (Exception e)
-        //        {
-        //            Trace.TraceError($"Ошибка выполнения задания в потоке {thread_name} : {e}");
-        //        }
-        //    }
-
-
-        //}
     }
 }
